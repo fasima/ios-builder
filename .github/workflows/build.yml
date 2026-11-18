@@ -1,0 +1,111 @@
+# Builds a private game's unsigned iPhone app. This repo holds only this file: the game is checked out from its private
+# repo with a token, and the finished IPA is AES-encrypted before upload, so nothing of the game is public.
+# Run: gh workflow run build.yml -R fasima/ios-builder -f game=lightway-ios -f app=Lightway -f bundle=au.implementai.games.lightway -f version=0.1
+# Decrypt: python projects\games\publishing\pipeline\decrypt_ipa.py <file.enc> <out.ipa>
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      game: {description: "private repo name under fasima", required: true}
+      ref: {description: "branch", required: false, default: "main"}
+      app: {description: "app / scheme name", required: true}
+      bundle: {description: "bundle identifier", required: true}
+      version: {description: "major.minor; the run number is added", required: true}
+
+env:
+  GODOT_VERSION: 4.7.2
+  GODOT_TAG: 4.7.2-stable
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Get the game
+        uses: actions/checkout@v4
+        with:
+          repository: fasima/${{ inputs.game }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SRC_TOKEN }}
+          path: game
+
+      - name: Select the newest Xcode
+        run: |
+          XC="$(ls -d /Applications/Xcode_*.app | grep -vi beta | sort -V | tail -1)"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+
+      - name: Cache Godot
+        id: godot-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/godot
+          key: godot-${{ env.GODOT_VERSION }}-macos-ios-v1
+
+      - name: Download Godot and the iOS template
+        if: steps.godot-cache.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          mkdir -p ~/godot/templates && cd ~/godot
+          curl -fsSL -o editor.zip "https://github.com/godotengine/godot/releases/download/${GODOT_TAG}/Godot_v${GODOT_TAG}_macos.universal.zip"
+          unzip -q editor.zip && rm editor.zip
+          curl -fsSL -o t.tpz "https://github.com/godotengine/godot/releases/download/${GODOT_TAG}/Godot_v${GODOT_TAG}_export_templates.tpz"
+          unzip -j -o t.tpz "templates/ios.zip" "templates/version.txt" -d templates && rm t.tpz
+
+      - name: Install the template
+        run: |
+          TPL="$HOME/Library/Application Support/Godot/export_templates/${GODOT_VERSION}.stable"
+          mkdir -p "$TPL" && cp ~/godot/templates/* "$TPL/"
+          echo "GODOT=$HOME/godot/Godot.app/Contents/MacOS/Godot" >> "$GITHUB_ENV"
+
+      - name: Export the Xcode project
+        working-directory: game
+        run: |
+          set -e
+          V="${{ inputs.version }}.${{ github.run_number }}"
+          sed -i '' 's/^application\/app_store_team_id=""/application\/app_store_team_id="UNSIGNED00"/' export_presets.cfg
+          sed -i '' "s/^application\/short_version=.*/application\/short_version=\"$V\"/" export_presets.cfg
+          sed -i '' "s/^application\/version=.*/application\/version=\"${{ github.run_number }}\"/" export_presets.cfg
+          sed -i '' "s/^config\/version=.*/config\/version=\"$V\"/" project.godot
+          "$GODOT" --headless --path . --import > "$RUNNER_TEMP/import.log" 2>&1 || true
+          mkdir -p "$RUNNER_TEMP/xc"
+          "$GODOT" --headless --path . --export-release "iOS" "$RUNNER_TEMP/xc/${{ inputs.app }}.ipa" > "$RUNNER_TEMP/export.log" 2>&1 || true
+          grep -nE "ERROR" "$RUNNER_TEMP/export.log" | head -20 || true
+          test -d "$RUNNER_TEMP/xc/${{ inputs.app }}.xcodeproj"
+          test -f "$RUNNER_TEMP/xc/${{ inputs.app }}.pck"
+
+      - name: Build for iPhone (Release, unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild build -project "$RUNNER_TEMP/xc/${{ inputs.app }}.xcodeproj" -scheme "${{ inputs.app }}" \
+            -configuration Release -sdk iphoneos -destination "generic/platform=iOS" -derivedDataPath "$RUNNER_TEMP/dd" \
+            CURRENT_PROJECT_VERSION=${{ github.run_number }} MARKETING_VERSION=${{ inputs.version }}.${{ github.run_number }} \
+            DEVELOPMENT_TEAM="" PROVISIONING_PROFILE="" PROVISIONING_PROFILE_SPECIFIER="" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" CODE_SIGN_ENTITLEMENTS="" \
+            > "$RUNNER_TEMP/build.log" 2>&1 || true
+          grep -E "error:" "$RUNNER_TEMP/build.log" | sed 's/[^ ]*\/game\///' | head -20 || true
+          grep -q "BUILD SUCCEEDED" "$RUNNER_TEMP/build.log"
+
+      - name: Pack, check and encrypt
+        env:
+          IPA_KEY: ${{ secrets.IPA_KEY }}
+        run: |
+          set -e
+          APP="$RUNNER_TEMP/dd/Build/Products/Release-iphoneos/${{ inputs.app }}.app"
+          P="$APP/Info.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$P")" = "${{ inputs.bundle }}"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$P")" = "${{ inputs.version }}.${{ github.run_number }}"
+          test -f "$APP/${{ inputs.app }}.pck" && test -f "$APP/Assets.car" && test ! -d "$APP/PlugIns"
+          mkdir -p "$RUNNER_TEMP/ipa/Payload" && cp -R "$APP" "$RUNNER_TEMP/ipa/Payload/"
+          cd "$RUNNER_TEMP/ipa" && zip -qry "$RUNNER_TEMP/app.ipa" Payload
+          ls -l "$RUNNER_TEMP/app.ipa"
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -salt -in "$RUNNER_TEMP/app.ipa" \
+            -out "$GITHUB_WORKSPACE/app.ipa.enc" -pass env:IPA_KEY
+          rm -rf "$RUNNER_TEMP/app.ipa" "$RUNNER_TEMP/ipa" "$RUNNER_TEMP/xc" "$RUNNER_TEMP/dd" game
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.app }}-${{ inputs.version }}.${{ github.run_number }}-enc
+          path: app.ipa.enc
+          retention-days: 7
